@@ -1,53 +1,31 @@
-"""
-MPE Partner Scraper — Streamlit UI
-Fixed: correct selenium imports, chromium binary path for Streamlit Cloud
-"""
+import os, re, json, time, threading, csv, io
+from pathlib import Path
 
 import streamlit as st
-import pandas as pd
-import time
-import re
-import os
-import json
-import threading
 from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import NoSuchElementException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 
-# ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="MPE Partner Scraper", page_icon="📡", layout="wide")
-
-# ─── CONSTANTS ───────────────────────────────────────────────────────────────
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
 BASE_URL   = "https://mpe.motorolasolutions.com/"
-CSV_FIELDS = ["company_name","website","email","program_level","community","region","address","phone"]
 STATE_FILE = "/tmp/mpe_state.json"
-LOG_FILE   = "/tmp/mpe_logs.txt"
+LOG_FILE   = "/tmp/mpe_log.txt"
 LOCK       = threading.Lock()
+CSV_FIELDS = ["company_name","website","email","program_level","community","region","address","phone"]
 
 ALL_REGIONS = [
-    "United States","Canada","United Kingdom","Australia",
-    "Germany","France","India","Brazil","Mexico",
-    "Netherlands","Spain","Italy","Sweden","Norway",
-    "Denmark","Finland","Poland","Belgium","Switzerland",
-    "Austria","South Africa","UAE","Singapore","Japan",
-    "South Korea","China","New Zealand","Ireland","Portugal",
-    "Czech Republic","Hungary","Romania","Israel",
+    "United States","Canada","Mexico","Brazil","Argentina","Colombia","Chile",
+    "United Kingdom","Germany","France","Italy","Spain","Netherlands","Belgium",
+    "Sweden","Norway","Denmark","Finland","Poland","Czech Republic","Austria","Switzerland",
+    "Australia","New Zealand","India","Japan","South Korea","Singapore","Malaysia",
+    "South Africa","UAE","Saudi Arabia","Israel","Turkey"
 ]
 
-# ─── FILE STATE HELPERS ───────────────────────────────────────────────────────
-def read_state():
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {"running": False, "done": False, "results": []}
-
+# ─── STATE HELPERS ───────────────────────────────────────────────────────────
 def write_state(state):
     with LOCK:
         with open(STATE_FILE, "w") as f:
@@ -55,10 +33,8 @@ def write_state(state):
 
 def reset_state():
     write_state({"running": False, "done": False, "results": []})
-    try:
-        os.remove(LOG_FILE)
-    except Exception:
-        pass
+    try: os.remove(LOG_FILE)
+    except: pass
 
 def append_log(msg):
     with LOCK:
@@ -68,10 +44,8 @@ def append_log(msg):
 def read_logs():
     try:
         if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "r") as f:
-                return f.read()
-    except Exception:
-        pass
+            with open(LOG_FILE, "r") as f: return f.read()
+    except: pass
     return ""
 
 def append_result(row):
@@ -80,7 +54,14 @@ def append_result(row):
         state["results"].append(row)
         write_state(state)
 
-# ─── DRIVER FACTORY ──────────────────────────────────────────────────────────
+def read_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f: return json.load(f)
+    except: pass
+    return {"running": False, "done": False, "results": []}
+
+# ─── DRIVER ──────────────────────────────────────────────────────────────────
 def make_driver():
     opts = Options()
     opts.add_argument("--headless=new")
@@ -89,39 +70,20 @@ def make_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/122 Safari/537.36"
-    )
+    opts.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36")
 
-    # Streamlit Cloud uses Debian chromium at /usr/bin/chromium
-    chromium_paths = [
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-    ]
-    for path in chromium_paths:
+    for path in ["/usr/bin/chromium","/usr/bin/chromium-browser","/usr/bin/google-chrome"]:
         if os.path.exists(path):
             opts.binary_location = path
             break
 
-    # chromedriver paths on Streamlit Cloud
-    driver_paths = [
-        "/usr/bin/chromedriver",
-        "/usr/lib/chromium/chromedriver",
-        "/usr/lib/chromium-browser/chromedriver",
-    ]
     service = None
-    for dp in driver_paths:
+    for dp in ["/usr/bin/chromedriver","/usr/lib/chromium/chromedriver","/usr/lib/chromium-browser/chromedriver"]:
         if os.path.exists(dp):
             service = Service(dp)
             break
 
-    if service:
-        return webdriver.Chrome(service=service, options=opts)
-    else:
-        return webdriver.Chrome(options=opts)  # fallback: auto-detect
+    return webdriver.Chrome(service=service, options=opts) if service else webdriver.Chrome(options=opts)
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 def extract_email(text):
@@ -132,302 +94,178 @@ def extract_phone(text):
     m = re.search(r"(\+?\d[\d\s\-().]{7,})", text or "")
     return m.group(1).strip() if m else ""
 
-def scrape_detail_page(driver, url):
-    data = {"website":"","email":"","phone":"","address":""}
+def wait_for_results(driver, timeout=15):
+    """Wait until the page has loaded some partner result content."""
     try:
-        driver.execute_script(f"window.open('{url}','_blank');")
-        driver.switch_to.window(driver.window_handles[-1])
-        time.sleep(2)
-        body = driver.find_element(By.TAG_NAME, "body").text
-        data["email"] = extract_email(body)
-        data["phone"] = extract_phone(body)
-        for a in driver.find_elements(By.XPATH, "//a[@href]"):
-            href = a.get_attribute("href") or ""
-            if href.startswith("http") and "motorola" not in href.lower():
-                data["website"] = href
-                break
-        driver.close()
-        driver.switch_to.window(driver.window_handles[0])
-    except Exception:
-        if len(driver.window_handles) > 1:
-            driver.close()
-            driver.switch_to.window(driver.window_handles[0])
-    return data
+        WebDriverWait(driver, timeout).until(
+            lambda d: len(d.find_elements(By.CSS_SELECTOR,
+                "[class*='partner'],[class*='result'],[class*='card'],[class*='dealer'],[class*='reseller'],article,li.item")) > 0
+        )
+        return True
+    except:
+        return False
+
+def scroll_page(driver, scroll_pause):
+    last_h = 0
+    for _ in range(6):
+        driver.execute_script("window.scrollTo(0,document.body.scrollHeight);")
+        time.sleep(scroll_pause)
+        new_h = driver.execute_script("return document.body.scrollHeight")
+        if new_h == last_h:
+            break
+        last_h = new_h
+    driver.execute_script("window.scrollTo(0,0);")
+
+def find_cards(driver):
+    """Try progressively broader selectors to find partner cards."""
+    selectors = [
+        "[class*='partner-card']",
+        "[class*='PartnerCard']",
+        "[class*='partner_card']",
+        "[class*='result-card']",
+        "[class*='resultCard']",
+        "[class*='dealer-card']",
+        "[class*='partnerResult']",
+        "[class*='partner-item']",
+        "[class*='locator-result']",
+        "div[class*='card'][class*='partner']",
+        "article",
+        "li[class*='result']",
+        "li[class*='partner']",
+        ".search-results > div",
+        "[data-component*='partner']",
+        "[data-testid*='partner']",
+        "[data-testid*='result']",
+    ]
+    for sel in selectors:
+        cards = driver.find_elements(By.CSS_SELECTOR, sel)
+        if len(cards) > 0:
+            return cards, sel
+    return [], None
 
 def parse_card(card, driver):
-    text = card.text
-    if not text.strip():
+    """Extract data from a partner card element."""
+    try:
+        text = card.text.strip()
+        if not text or len(text) < 5:
+            return None
+
+        row = {f: "" for f in CSV_FIELDS}
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        if not lines:
+            return None
+
+        row["company_name"] = lines[0]
+
+        # Look for program level keywords
+        for line in lines:
+            ll = line.lower()
+            for lvl in ["platinum","gold","silver","bronze","authorized","premier","elite","select"]:
+                if lvl in ll:
+                    row["program_level"] = line
+                    break
+
+        # Community / category
+        for line in lines:
+            ll = line.lower()
+            for cat in ["video","radio","software","security","command","critical","broadband","mototrbo","radio","two-way"]:
+                if cat in ll and line != row["program_level"]:
+                    row["community"] = line
+                    break
+
+        # Address lines (after company name)
+        addr_lines = []
+        for line in lines[1:]:
+            if re.search(r'\d{4,}|\b[A-Z]{2}\b|\bstreet\b|\bave\b|\brd\b|\bblvd\b|\bsuite\b|\bst\b', line, re.I):
+                addr_lines.append(line)
+        row["address"] = ", ".join(addr_lines[:3])
+
+        # Phone in card text
+        row["phone"] = extract_phone(text)
+
+        # Try to get link for detail page
+        try:
+            link = card.find_element(By.TAG_NAME, "a")
+            href = link.get_attribute("href")
+            if href and href.startswith("http"):
+                row["website"] = href
+                # Visit detail page for email
+                detail = scrape_detail_page(driver, href)
+                row.update({k: v for k, v in detail.items() if v})
+        except:
+            pass
+
+        return row if row["company_name"] else None
+    except Exception as e:
         return None
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    company_name = lines[0] if lines else ""
-    program_level, community = "", ""
-    for line in lines:
-        low = line.lower()
-        if not program_level and any(x in low for x in
-            ["platinum","gold","silver","bronze","authorized","premier","elite"]):
-            program_level = line
-        if not community and any(x in low for x in
-            ["video","radio","communications","security","software","services","command"]):
-            community = line
-    detail = {"website":"","email":"","phone":"","address":""}
+
+def scrape_detail_page(driver, url):
+    data = {"email": "", "website": "", "phone": ""}
     try:
-        link_el = card.find_element(By.TAG_NAME, "a")
-        href = link_el.get_attribute("href") or ""
-        if href and href != BASE_URL and "motorolasolutions" in href:
-            detail = scrape_detail_page(driver, href)
-    except NoSuchElementException:
-        pass
-    if not detail["email"]:
-        detail["email"] = extract_email(text)
-    if not detail["website"]:
-        for a in card.find_elements(By.TAG_NAME, "a"):
-            h = a.get_attribute("href") or ""
-            if h.startswith("http") and "motorola" not in h.lower():
-                detail["website"] = h
+        main_handle = driver.current_window_handle
+        driver.execute_script(f"window.open('{url}','_blank');")
+        time.sleep(1.5)
+        handles = driver.window_handles
+        driver.switch_to.window(handles[-1])
+        time.sleep(2)
+
+        body = driver.find_element(By.TAG_NAME, "body").text
+        data["email"] = extract_email(body)
+        if not data["phone"]:
+            data["phone"] = extract_phone(body)
+
+        # Get external website link
+        for a in driver.find_elements(By.TAG_NAME, "a"):
+            href = a.get_attribute("href") or ""
+            if href.startswith("http") and "motorolasolutions" not in href and "mpe." not in href:
+                data["website"] = href
                 break
-    return {
-        "company_name":  company_name,
-        "website":       detail["website"],
-        "email":         detail["email"],
-        "program_level": program_level,
-        "community":     community,
-        "address":       detail.get("address",""),
-        "phone":         detail.get("phone",""),
-    }
 
-# ─── SCRAPER THREAD ───────────────────────────────────────────────────────────
-def run_scraper(regions, scroll_pause, page_pause):
-    append_log("🚀 Scraper started...")
+        driver.close()
+        driver.switch_to.window(main_handle)
+    except:
+        try:
+            driver.switch_to.window(driver.window_handles[0])
+        except:
+            pass
+    return data
+
+# ─── REGION SELECTION STRATEGIES ─────────────────────────────────────────────
+def try_select_region(driver, region, append_log_fn):
+    """Try multiple strategies to filter by region. Returns True if successful."""
+
+    # Strategy 1: URL parameter injection (most reliable for JS SPAs)
+    url_variants = [
+        f"{BASE_URL}?country={region.replace(' ', '+')}",
+        f"{BASE_URL}?region={region.replace(' ', '+')}",
+        f"{BASE_URL}?location={region.replace(' ', '+')}",
+        f"{BASE_URL}#{region.lower().replace(' ', '-')}",
+    ]
+
+    # Strategy 2: Standard <select> dropdown
     try:
-        driver = make_driver()
-        append_log("✅ Chrome driver started successfully")
-    except Exception as e:
-        append_log(f"❌ Failed to start Chrome driver: {e}")
-        state = read_state()
-        state["running"] = False
-        state["done"] = True
-        write_state(state)
-        return
-
-    try:
-        for region in regions:
-            append_log(f"▶ Scraping region: {region}")
-            region_count = 0
-            try:
-                driver.get(BASE_URL)
-                time.sleep(3)
-
-                selected = False
-                # Try dropdown
-                try:
-                    from selenium.webdriver.support.ui import Select
-                    dd = WebDriverWait(driver, 8).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR,
-                        "select[name*='country'],select[name*='region'],[data-filter*='country']"))
-                    )
-                    Select(dd).select_by_visible_text(region)
-                    time.sleep(2)
-                    selected = True
-                except Exception:
-                    pass
-
-                # Try button/li
-                if not selected:
-                    try:
-                        btn = driver.find_element(By.XPATH,
-                            f"//button[normalize-space()='{region}']|//li[normalize-space()='{region}']")
-                        driver.execute_script("arguments[0].click();", btn)
-                        time.sleep(2)
-                        selected = True
-                    except Exception:
-                        pass
-
-                if not selected:
-                    # Log the page source snippet for debugging
-                    page_title = driver.title
-                    append_log(f"  ⚠ Could not select '{region}' (page: '{page_title}') – skipping")
-                    continue
-
-                page_num = 1
-                while True:
-                    append_log(f"  Page {page_num}…")
-                    time.sleep(page_pause)
-
-                    # Scroll to load lazy content
-                    last_h = 0
-                    for _ in range(5):
-                        driver.execute_script("window.scrollTo(0,document.body.scrollHeight);")
-                        time.sleep(scroll_pause)
-                        new_h = driver.execute_script("return document.body.scrollHeight")
-                        if new_h == last_h:
-                            break
-                        last_h = new_h
-                    driver.execute_script("window.scrollTo(0,0);")
-
-                    cards = driver.find_elements(By.CSS_SELECTOR,
-                        ".partner-card,.result-item,[class*='partner'],[class*='result'],.card,article")
-
-                    if not cards:
-                        # Try to log visible text for debugging
-                        body_text = driver.find_element(By.TAG_NAME, "body").text[:300]
-                        append_log(f"  No cards found. Page text: {body_text[:200]}")
-                        break
-
-                    for card in cards:
-                        try:
-                            row = parse_card(card, driver)
-                            if row:
-                                row["region"] = region
-                                append_result(row)
-                                region_count += 1
-                        except Exception as ce:
-                            append_log(f"  Card error: {ce}")
-
-                    append_log(f"  ✓ {len(cards)} cards | region total: {region_count}")
-
-                    # Next page
-                    try:
-                        nxt = driver.find_element(By.CSS_SELECTOR,
-                            "a[aria-label='Next'],button[aria-label='Next'],"
-                            ".pagination-next,[class*='next-page']:not([disabled])")
-                        if not nxt.is_enabled():
-                            break
-                        driver.execute_script("arguments[0].click();", nxt)
-                        page_num += 1
-                    except NoSuchElementException:
-                        break
-
-                append_log(f"✅ {region} done — {region_count} partners")
-            except Exception as e:
-                append_log(f"  ❌ Error in {region}: {e}")
-
-        driver.quit()
-    except Exception as e:
-        append_log(f"❌ Scraper error: {e}")
-
-    # Deduplicate & finalise
-    state = read_state()
-    seen, unique = set(), []
-    for p in state["results"]:
-        key = (p["company_name"].lower(), p["region"].lower())
-        if key not in seen:
-            seen.add(key)
-            unique.append(p)
-    state["results"] = unique
-    state["running"] = False
-    state["done"] = True
-    write_state(state)
-    append_log(f"🎉 Complete! {len(unique)} unique partners saved.")
-
-# ─── UI ──────────────────────────────────────────────────────────────────────
-state = read_state()
-
-st.title("📡 MPE Partner Scraper")
-st.caption("Motorola Solutions PartnerEmpower — Bulk Partner Data Extractor")
-
-# Sidebar
-with st.sidebar:
-    st.header("⚙️ Settings")
-    selected_regions = st.multiselect(
-        "Regions to scrape", options=ALL_REGIONS, default=["United States"]
-    )
-    scroll_pause = st.slider("Scroll pause (sec)", 0.5, 5.0, 1.5, 0.5)
-    page_pause   = st.slider("Page load pause (sec)", 1.0, 10.0, 2.0, 0.5)
-    st.divider()
-    if state["running"]:
-        st.warning("⏳ Scraping in progress…")
-        if st.button("🔄 Refresh to update", use_container_width=True):
-            st.rerun()
-    elif state["done"]:
-        st.success(f"✅ Done! {len(state['results'])} partners")
-    else:
-        st.info("💡 Start with 1 region to test first.")
-
-# Action row
-col1, col2, col3 = st.columns([2,2,3])
-with col1:
-    if not state["running"]:
-        if st.button("🚀 Start Scraping", type="primary",
-                     disabled=not selected_regions, use_container_width=True):
-            reset_state()
-            write_state({"running": True, "done": False, "results": []})
-            t = threading.Thread(
-                target=run_scraper,
-                args=(selected_regions, scroll_pause, page_pause),
-                daemon=True,
-            )
-            t.start()
-            time.sleep(1)
-            st.rerun()
-    else:
-        if st.button("🔄 Refresh Results", use_container_width=True, type="primary"):
-            st.rerun()
-
-with col2:
-    if st.button("🗑️ Clear / Reset", use_container_width=True, disabled=state["running"]):
-        reset_state()
-        st.rerun()
-
-with col3:
-    results = state["results"]
-    if results:
-        df_dl = pd.DataFrame(results, columns=CSV_FIELDS)
-        st.download_button(
-            "⬇️ Download CSV",
-            data=df_dl.to_csv(index=False).encode("utf-8"),
-            file_name="mpe_partners.csv",
-            mime="text/csv",
-            use_container_width=True,
+        from selenium.webdriver.support.ui import Select
+        dd = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR,
+            "select"))
         )
-    else:
-        st.button("⬇️ Download CSV", disabled=True, use_container_width=True)
+        opts = [o.text.strip().lower() for o in dd.find_elements(By.TAG_NAME, "option")]
+        if any(region.lower() in o for o in opts):
+            Select(dd).select_by_visible_text(region)
+            time.sleep(2.5)
+            append_log_fn(f"  ✓ Region set via <select>")
+            return True
+    except:
+        pass
 
-st.divider()
-
-# Metrics
-results = state["results"]
-m1,m2,m3,m4 = st.columns(4)
-m1.metric("Total Partners",  len(results))
-m2.metric("With Email",      sum(1 for r in results if r.get("email")))
-m3.metric("With Website",    sum(1 for r in results if r.get("website")))
-m4.metric("Regions Done",    len(set(r.get("region","") for r in results)))
-
-st.divider()
-
-# Tabs
-tab1, tab2 = st.tabs(["📋 Results Table", "📜 Live Logs"])
-
-with tab1:
-    if results:
-        df = pd.DataFrame(results, columns=CSV_FIELDS)
-        fc1,fc2,fc3 = st.columns(3)
-        with fc1:
-            f_region = st.multiselect("Filter Region",
-                options=sorted(df["region"].unique()), key="f_reg")
-        with fc2:
-            f_level = st.multiselect("Filter Program Level",
-                options=sorted(df["program_level"].dropna().unique()), key="f_lvl")
-        with fc3:
-            f_search = st.text_input("Search company", key="f_srch")
-        filtered = df.copy()
-        if f_region:  filtered = filtered[filtered["region"].isin(f_region)]
-        if f_level:   filtered = filtered[filtered["program_level"].isin(f_level)]
-        if f_search:  filtered = filtered[filtered["company_name"].str.contains(f_search, case=False, na=False)]
-        st.dataframe(filtered, use_container_width=True, height=420)
-        st.caption(f"Showing {len(filtered)} of {len(df)} records")
-    else:
-        st.info("No data yet. Configure settings and click **Start Scraping**.")
-
-with tab2:
-    logs = read_logs()
-    if logs:
-        st.text_area("Logs", logs, height=420, key="log_area")
-        if state["running"]:
-            st.caption("Page auto-refreshes every 5 sec while scraping.")
-    else:
-        st.info("Logs will appear here once scraping starts.")
-
-# Auto-refresh while running
-if state["running"]:
-    time.sleep(5)
-    st.rerun()
+    # Strategy 3: Click a button/tab/li with region name
+    try:
+        xp = (f"//button[contains(translate(normalize-space(),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'{region.upper()}')]"
+              f"|//li[contains(translate(normalize-space(),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'{region.upper()}')]"
+              f"|//a[contains(translate(normalize-space(),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'{region.upper()}')]"
+              f"|//span[contains(translate(normalize-space(),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'{region.upper()}')]")
+        btn = driver.find_element(By.XPATH, xp)
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+        driver.execute_script("arguments[0].click();", btn)
+        time.sleep(2.5)
+        append_log_fn(f"  ✓ Region set via click
